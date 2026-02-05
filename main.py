@@ -63,7 +63,8 @@ TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
 TELEGRAM_SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME")
 
-# Check if a string session exists in environment, otherwise use file-based session
+# Check if a bot token, string session, or file-based session exists
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")
 
 mcp = FastMCP("telegram")
@@ -375,6 +376,25 @@ async def get_messages(chat_id: Union[int, str], page: int = 1, page_size: int =
         page_size: Number of messages per page.
     """
     try:
+        if BOT_TOKEN:
+            import httpx
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+            async with httpx.AsyncClient() as http:
+                resp = await http.post(url, json={"allowed_updates": ["message"], "limit": page_size})
+                resp.raise_for_status()
+                data = resp.json()
+            if not data.get("result"):
+                return "No new messages."
+            lines = []
+            for update in data["result"]:
+                msg = update.get("message", {})
+                sender = msg.get("from", {})
+                sender_name = sender.get("first_name", "Unknown")
+                text = msg.get("text", "")
+                date = msg.get("date", "")
+                msg_id = msg.get("message_id", "")
+                lines.append(f"ID: {msg_id} | {sender_name} | Date: {date} | Message: {text}")
+            return "\n".join(lines)
         entity = await client.get_entity(chat_id)
         offset = (page - 1) * page_size
         messages = await client.get_messages(entity, limit=page_size, add_offset=offset)
@@ -412,7 +432,7 @@ async def send_message(chat_id: Union[int, str], message: str) -> str:
     """
     try:
         entity = await client.get_entity(chat_id)
-        await client.send_message(entity, message)
+        await client.send_message(entity, message, silent=False)
         return "Message sent successfully."
     except Exception as e:
         return log_and_format_error("send_message", e, chat_id=chat_id)
@@ -4128,7 +4148,7 @@ async def _main() -> None:
     try:
         # Start the Telethon client non-interactively
         print("Starting Telegram client...")
-        await client.start()
+        await client.start(bot_token=BOT_TOKEN)
 
         print("Telegram client started. Running MCP server...")
         # Use the asynchronous entrypoint instead of mcp.run()
