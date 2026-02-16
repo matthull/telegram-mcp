@@ -67,7 +67,10 @@ TELEGRAM_SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")
 
-mcp = FastMCP("telegram")
+MCP_PORT = int(os.getenv("MCP_PORT", "8485"))
+MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "sse")
+
+mcp = FastMCP("telegram", host="127.0.0.1", port=MCP_PORT)
 
 # Personal notification channel config
 NOTIFY_CHAT_ID = os.getenv("NOTIFY_CHAT_ID")
@@ -90,6 +93,10 @@ elif BOT_TOKEN:
 else:
     # Use file-based session for user accounts (single instance only)
     client = TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+
+# Auto-sleep on flood limits instead of crashing (up to 1 hour).
+# With singleton architecture, this only happens on service restart.
+client.flood_sleep_threshold = 3600
 
 # Setup robust logging with both file and console output
 logger = logging.getLogger("telegram_mcp")
@@ -4434,19 +4441,18 @@ async def reorder_folders(folder_ids: List[int]) -> str:
 async def _main() -> None:
     try:
         # Start the Telethon client non-interactively
-        print("Starting Telegram client...")
+        print("Starting Telegram client...", file=sys.stderr)
         await client.start(bot_token=BOT_TOKEN)
+        print("Telegram client started.", file=sys.stderr)
 
-        print("Telegram client started. Running MCP server...")
-        # Use the asynchronous entrypoint instead of mcp.run()
-        await mcp.run_stdio_async()
+        if MCP_TRANSPORT == "stdio":
+            print("Running MCP server (stdio)...", file=sys.stderr)
+            await mcp.run_stdio_async()
+        else:
+            print(f"Running MCP server (SSE on 127.0.0.1:{MCP_PORT})...", file=sys.stderr)
+            await mcp.run_sse_async()
     except Exception as e:
         print(f"Error starting client: {e}", file=sys.stderr)
-        if isinstance(e, sqlite3.OperationalError) and "database is locked" in str(e):
-            print(
-                "Database lock detected. Please ensure no other instances are running.",
-                file=sys.stderr,
-            )
         sys.exit(1)
 
 
