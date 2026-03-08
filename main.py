@@ -16,29 +16,21 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from pythonjsonlogger import jsonlogger
-from telethon import TelegramClient, functions, utils
-from telethon.sessions import StringSession
-from telethon.tl.types import (
-    User,
-    Chat,
-    Channel,
-    ChatAdminRights,
-    ChatBannedRights,
-    ChannelParticipantsKicked,
-    ChannelParticipantsAdmins,
-    InputChatPhoto,
-    InputChatUploadedPhoto,
-    InputChatPhotoEmpty,
-    InputPeerUser,
-    InputPeerChat,
-    InputPeerChannel,
-    DialogFilter,
-    DialogFilterDefault,
-    TextWithEntities,
-)
+# Telethon imports — only needed if raw tools are re-enabled.
+# Commented out 2026-02-23: all active tools now use Bot HTTP API.
+# from telethon import TelegramClient, functions, utils
+# from telethon.sessions import StringSession
+# from telethon.tl.types import (
+#     User, Chat, Channel, ChatAdminRights, ChatBannedRights,
+#     ChannelParticipantsKicked, ChannelParticipantsAdmins,
+#     InputChatPhoto, InputChatUploadedPhoto, InputChatPhotoEmpty,
+#     InputPeerUser, InputPeerChat, InputPeerChannel,
+#     DialogFilter, DialogFilterDefault, TextWithEntities,
+# )
+# import telethon.errors.rpcerrorlist
 import re
 from functools import wraps
-import telethon.errors.rpcerrorlist
+import httpx
 
 
 class ValidationError(Exception):
@@ -77,26 +69,38 @@ NOTIFY_CHAT_ID = os.getenv("NOTIFY_CHAT_ID")
 if NOTIFY_CHAT_ID:
     NOTIFY_CHAT_ID = int(NOTIFY_CHAT_ID)
 
-# Server-side tracking of last seen message ID for check_replies
+# Server-side tracking of last seen message ID for check_replies (DM path, no inbound loop)
 _last_seen_message_id = 0
+
+# Forum supergroup config for topic-based routing
+TELEGRAM_FORUM_GROUP_ID = os.getenv("TELEGRAM_FORUM_GROUP_ID")
+if TELEGRAM_FORUM_GROUP_ID:
+    TELEGRAM_FORUM_GROUP_ID = int(TELEGRAM_FORUM_GROUP_ID)
+
+# Topic registry for tmux_target → forum topic mappings
+from topic_registry import TopicRegistry
+from forum_helpers import bot_send_message, resolve_topic, close_forum_topic, reopen_forum_topic
+from inbound_loop import run_inbound_loop
+from message_buffer import MessageBuffer
+
+_registry_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "topic_registry.json")
+topic_registry = TopicRegistry(_registry_path)
+
+# Shared message buffer — populated by inbound loop, read by tools
+_message_buffer = MessageBuffer()
+
+# Track whether the inbound loop is running (set at startup)
+_inbound_loop_active = False
 
 # Autonomy calibration log path
 CALIBRATION_LOG = os.path.expanduser("~/egregore/metrics/autonomy-calibration.log")
 
-if SESSION_STRING:
-    # Use the string session if available
-    client = TelegramClient(StringSession(SESSION_STRING), TELEGRAM_API_ID, TELEGRAM_API_HASH)
-elif BOT_TOKEN:
-    # Bots re-authenticate with token each time — no need for file-based session.
-    # Using StringSession avoids SQLite locks when multiple MCP instances run concurrently.
-    client = TelegramClient(StringSession(), TELEGRAM_API_ID, TELEGRAM_API_HASH)
-else:
-    # Use file-based session for user accounts (single instance only)
-    client = TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH)
 
-# Auto-sleep on flood limits instead of crashing (up to 1 hour).
-# With singleton architecture, this only happens on service restart.
-client.flood_sleep_threshold = 3600
+async def _bot_send_message(
+    chat_id: int, text: str, message_thread_id: int | None = None
+) -> dict:
+    """Send via canonical bot_send_message from forum_helpers."""
+    return await bot_send_message(BOT_TOKEN, chat_id, text, message_thread_id)
 
 # Setup robust logging with both file and console output
 logger = logging.getLogger("telegram_mcp")
@@ -373,7 +377,7 @@ def get_engagement_info(message) -> str:
         destructiveHint=True,
     )
 )
-async def notify(message: str) -> str:
+async def notify(message: str, tmux_target: str | None = None) -> str:
     """
     Send a message to Matt via Telegram. Use this when you need to notify,
     ask a question, share a status update, or communicate anything to the user
@@ -386,15 +390,82 @@ async def notify(message: str) -> str:
 
     Args:
         message: The message text (markdown supported).
+        tmux_target: Optional tmux target (e.g. "village:chart"). When provided,
+            routes message to a forum topic instead of DM.
     """
+    if tmux_target:
+        if not TELEGRAM_FORUM_GROUP_ID:
+            return "Error: TELEGRAM_FORUM_GROUP_ID not configured in .env"
+        try:
+            thread_id = await resolve_topic(
+                BOT_TOKEN, TELEGRAM_FORUM_GROUP_ID, tmux_target, topic_registry
+            )
+            await _bot_send_message(TELEGRAM_FORUM_GROUP_ID, message, message_thread_id=thread_id)
+            return "Message sent."
+        except Exception as e:
+            return log_and_format_error("notify", e, chat_id=TELEGRAM_FORUM_GROUP_ID)
     if not NOTIFY_CHAT_ID:
         return "Error: NOTIFY_CHAT_ID not configured in .env"
     try:
-        entity = await client.get_entity(NOTIFY_CHAT_ID)
-        await client.send_message(entity, message, silent=False)
+        await _bot_send_message(NOTIFY_CHAT_ID, message)
         return "Message sent."
     except Exception as e:
         return log_and_format_error("notify", e, chat_id=NOTIFY_CHAT_ID)
+
+
+async def _check_replies_direct(
+    thread_id: int | None = None,
+    tmux_target: str | None = None,
+) -> str:
+    """Shared helper: one-shot getUpdates check for new replies (fallback, no inbound loop).
+
+    Args:
+        thread_id: If set, filter to this forum thread only.
+        tmux_target: If set, use per-topic last_seen tracking. Otherwise use global DM tracking.
+    """
+    global _last_seen_message_id
+
+    if tmux_target:
+        last_seen = topic_registry.get_last_seen(tmux_target) or 0
+    else:
+        last_seen = _last_seen_message_id
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+    async with httpx.AsyncClient() as http:
+        params = {"allowed_updates": ["message"], "limit": 20}
+        if last_seen > 0:
+            params["offset"] = last_seen + 1
+        resp = await http.post(url, json=params)
+        resp.raise_for_status()
+        data = resp.json()
+
+    if not data.get("result"):
+        return "No new replies."
+
+    lines = []
+    max_update_id = last_seen
+    for update in data["result"]:
+        update_id = update.get("update_id", 0)
+        msg = update.get("message", {})
+        # Filter by thread_id if topic path
+        if thread_id is not None and msg.get("message_thread_id") != thread_id:
+            continue
+        if update_id > max_update_id:
+            max_update_id = update_id
+        text = msg.get("text", "")
+        date = msg.get("date", "")
+        if text:
+            lines.append(f"[{date}] {text}")
+
+    if max_update_id > last_seen:
+        if tmux_target:
+            topic_registry.set_last_seen(tmux_target, max_update_id)
+        else:
+            _last_seen_message_id = max_update_id
+
+    if not lines:
+        return "No new replies."
+    return "Replies from Matt:\n" + "\n".join(lines)
 
 
 @mcp.tool(
@@ -404,51 +475,212 @@ async def notify(message: str) -> str:
         readOnlyHint=True,
     )
 )
-async def check_replies() -> str:
+async def check_replies(tmux_target: str | None = None) -> str:
     """
     Check for new messages from Matt since the last check. Returns only
     messages not previously seen (tracks last-seen ID server-side).
 
     Returns "No new replies." if nothing new, otherwise returns the messages.
     Call this after sending a notification to see if Matt has responded.
+
+    Args:
+        tmux_target: Optional tmux target (e.g. "village:chart"). When provided,
+            checks only the forum topic for that target using per-topic tracking.
     """
     global _last_seen_message_id
     if not BOT_TOKEN:
         return "Error: Bot token required for check_replies"
+
+    # When inbound loop is active, read from buffer
+    if _inbound_loop_active:
+        try:
+            if tmux_target:
+                if not TELEGRAM_FORUM_GROUP_ID:
+                    return "Error: TELEGRAM_FORUM_GROUP_ID not configured in .env"
+                thread_id = topic_registry.get_topic_id(tmux_target)
+                if thread_id is None:
+                    return "No new replies."
+                messages = await _message_buffer.consume(tmux_target)
+            else:
+                messages = await _message_buffer.consume(MessageBuffer.DM_KEY)
+
+            if not messages:
+                return "No new replies."
+            lines = []
+            for msg in messages:
+                text = msg.get("text", "")
+                date = msg.get("date", "")
+                if text:
+                    lines.append(f"[{date}] {text}")
+            if not lines:
+                return "No new replies."
+            return "Replies from Matt:\n" + "\n".join(lines)
+        except Exception as e:
+            return log_and_format_error("check_replies", e)
+
+    # Fallback: direct getUpdates (DM-only mode, no inbound loop)
+    if tmux_target:
+        if not TELEGRAM_FORUM_GROUP_ID:
+            return "Error: TELEGRAM_FORUM_GROUP_ID not configured in .env"
+        try:
+            thread_id = topic_registry.get_topic_id(tmux_target)
+            if thread_id is None:
+                return "No new replies."
+            return await _check_replies_direct(thread_id=thread_id, tmux_target=tmux_target)
+        except Exception as e:
+            return log_and_format_error("check_replies", e)
     try:
-        import httpx
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+        return await _check_replies_direct()
+    except Exception as e:
+        return log_and_format_error("check_replies", e)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Close Forum Topic",
+        openWorldHint=True,
+        destructiveHint=True,
+    )
+)
+async def close_topic(tmux_target: str) -> str:
+    """
+    Close (archive) a forum topic. The topic becomes read-only in Telegram
+    but is preserved for future reopening.
+
+    Called when a tmux window closes or a session ends. The topic will be
+    automatically reopened if a new message is sent to the same tmux_target.
+
+    Args:
+        tmux_target: The tmux target whose topic to close (e.g. "village:chart").
+    """
+    if not TELEGRAM_FORUM_GROUP_ID:
+        return "Error: TELEGRAM_FORUM_GROUP_ID not configured in .env"
+    topic_id = topic_registry.get_topic_id(tmux_target)
+    if topic_id is None:
+        return f"Error: No topic found for tmux_target '{tmux_target}'"
+    if topic_registry.is_closed(tmux_target):
+        return f"Topic '{tmux_target}' is already closed."
+    try:
+        await close_forum_topic(BOT_TOKEN, TELEGRAM_FORUM_GROUP_ID, topic_id)
+        topic_registry.set_closed(tmux_target)
+        return f"Topic '{tmux_target}' closed."
+    except Exception as e:
+        return log_and_format_error("close_topic", e, chat_id=TELEGRAM_FORUM_GROUP_ID)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="List Active Topics",
+        openWorldHint=True,
+        readOnlyHint=True,
+    )
+)
+async def list_active_topics() -> str:
+    """
+    List current topic-to-tmux_target mappings with their status.
+
+    Returns all registered topics showing tmux_target, topic_id, and
+    whether the topic is open or closed. Useful for debugging and observability.
+    """
+    topics = topic_registry.list_topics()
+    if not topics:
+        return "No topics registered."
+    lines = []
+    for t in topics:
+        lines.append(f"  {t['tmux_target']} → topic:{t['topic_id']} ({t['status']})")
+    return f"Registered topics ({len(topics)}):\n" + "\n".join(lines)
+
+
+async def _poll_for_reply_buffer(
+    buffer_key: str, timeout_seconds: int, poll_interval: int,
+) -> str:
+    """Shared helper: poll message buffer for a reply. Used by ask/andon when inbound loop is active."""
+    elapsed = 0
+    while elapsed < timeout_seconds:
+        messages = await _message_buffer.wait_for_messages(buffer_key, timeout=poll_interval)
+        elapsed += poll_interval
+        if messages:
+            replies = [m["text"] for m in messages if m.get("text")]
+            if replies:
+                return "Matt replied:\n" + "\n".join(replies)
+    return f"No reply received after {timeout_seconds}s timeout."
+
+
+async def _poll_for_reply_direct(
+    timeout_seconds: int,
+    poll_interval: int,
+    thread_id: int | None = None,
+    tmux_target: str | None = None,
+) -> str:
+    """Shared helper: poll getUpdates directly for a reply (fallback when no inbound loop).
+
+    Args:
+        timeout_seconds: Max wait time.
+        poll_interval: Seconds between polls.
+        thread_id: If set, filter messages to this forum thread only (topic path).
+        tmux_target: If set, use per-topic last_seen tracking. Otherwise use global DM tracking.
+    """
+    global _last_seen_message_id
+
+    # Resolve offset tracking — per-topic or global
+    if tmux_target:
+        last_seen = topic_registry.get_last_seen(tmux_target) or 0
+    else:
+        last_seen = _last_seen_message_id
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+
+    # Establish baseline
+    async with httpx.AsyncClient() as http:
+        params = {"allowed_updates": ["message"], "limit": 20}
+        if last_seen > 0:
+            params["offset"] = last_seen + 1
+        resp = await http.post(url, json=params)
+        resp.raise_for_status()
+        data = resp.json()
+        for update in data.get("result", []):
+            uid = update.get("update_id", 0)
+            if uid > last_seen:
+                last_seen = uid
+
+    # Poll for reply
+    elapsed = 0
+    while elapsed < timeout_seconds:
+        await asyncio.sleep(poll_interval)
+        elapsed += poll_interval
+
         async with httpx.AsyncClient() as http:
-            params = {"allowed_updates": ["message"], "limit": 20}
-            if _last_seen_message_id > 0:
-                # Use offset to only get updates after last seen
-                params["offset"] = _last_seen_message_id + 1
+            params = {
+                "allowed_updates": ["message"],
+                "limit": 20,
+                "offset": last_seen + 1,
+            }
             resp = await http.post(url, json=params)
             resp.raise_for_status()
             data = resp.json()
 
-        if not data.get("result"):
-            return "No new replies."
+        if data.get("result"):
+            replies = []
+            for update in data["result"]:
+                uid = update.get("update_id", 0)
+                if uid > last_seen:
+                    last_seen = uid
+                msg = update.get("message", {})
+                # Filter by thread_id if topic path
+                if thread_id is not None and msg.get("message_thread_id") != thread_id:
+                    continue
+                text = msg.get("text", "")
+                if text:
+                    replies.append(text)
+            # Persist offset
+            if tmux_target:
+                topic_registry.set_last_seen(tmux_target, last_seen)
+            else:
+                _last_seen_message_id = last_seen
+            if replies:
+                return "Matt replied:\n" + "\n".join(replies)
 
-        lines = []
-        max_update_id = _last_seen_message_id
-        for update in data["result"]:
-            update_id = update.get("update_id", 0)
-            if update_id > max_update_id:
-                max_update_id = update_id
-            msg = update.get("message", {})
-            text = msg.get("text", "")
-            date = msg.get("date", "")
-            if text:
-                lines.append(f"[{date}] {text}")
-
-        _last_seen_message_id = max_update_id
-
-        if not lines:
-            return "No new replies."
-        return "Replies from Matt:\n" + "\n".join(lines)
-    except Exception as e:
-        return log_and_format_error("check_replies", e)
+    return f"No reply received after {timeout_seconds}s timeout."
 
 
 @mcp.tool(
@@ -458,7 +690,10 @@ async def check_replies() -> str:
         destructiveHint=True,
     )
 )
-async def ask(message: str, timeout_seconds: int = 300, poll_interval: int = 30) -> str:
+async def ask(
+    message: str, tmux_target: str | None = None,
+    timeout_seconds: int = 300, poll_interval: int = 30,
+) -> str:
     """
     Send a message to Matt and wait for a reply. Blocks until Matt responds
     or the timeout is reached. Use this when you need input before continuing.
@@ -468,63 +703,35 @@ async def ask(message: str, timeout_seconds: int = 300, poll_interval: int = 30)
 
     Args:
         message: The question or message to send (markdown supported).
+        tmux_target: Optional tmux target (e.g. "village:chart"). When provided,
+            sends to and polls from a forum topic instead of DM.
         timeout_seconds: Max seconds to wait for reply (default: 300 = 5 min).
         poll_interval: Seconds between polling attempts (default: 30).
     """
-    global _last_seen_message_id
+    if tmux_target:
+        if not TELEGRAM_FORUM_GROUP_ID:
+            return "Error: TELEGRAM_FORUM_GROUP_ID not configured in .env"
+        try:
+            thread_id = await resolve_topic(
+                BOT_TOKEN, TELEGRAM_FORUM_GROUP_ID, tmux_target, topic_registry
+            )
+            await _bot_send_message(
+                TELEGRAM_FORUM_GROUP_ID, message, message_thread_id=thread_id
+            )
+            if _inbound_loop_active:
+                return await _poll_for_reply_buffer(tmux_target, timeout_seconds, poll_interval)
+            else:
+                return await _poll_for_reply_direct(timeout_seconds, poll_interval, thread_id=thread_id, tmux_target=tmux_target)
+        except Exception as e:
+            return log_and_format_error("ask", e)
     if not NOTIFY_CHAT_ID or not BOT_TOKEN:
         return "Error: NOTIFY_CHAT_ID and TELEGRAM_BOT_TOKEN required"
     try:
-        # Send the message
-        entity = await client.get_entity(NOTIFY_CHAT_ID)
-        await client.send_message(entity, message, silent=False)
-
-        # Establish baseline — consume any pending updates
-        import httpx
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-        async with httpx.AsyncClient() as http:
-            params = {"allowed_updates": ["message"], "limit": 20}
-            if _last_seen_message_id > 0:
-                params["offset"] = _last_seen_message_id + 1
-            resp = await http.post(url, json=params)
-            resp.raise_for_status()
-            data = resp.json()
-            # Update baseline from any existing updates
-            for update in data.get("result", []):
-                uid = update.get("update_id", 0)
-                if uid > _last_seen_message_id:
-                    _last_seen_message_id = uid
-
-        # Poll for new reply
-        elapsed = 0
-        while elapsed < timeout_seconds:
-            await asyncio.sleep(poll_interval)
-            elapsed += poll_interval
-
-            async with httpx.AsyncClient() as http:
-                params = {
-                    "allowed_updates": ["message"],
-                    "limit": 20,
-                    "offset": _last_seen_message_id + 1,
-                }
-                resp = await http.post(url, json=params)
-                resp.raise_for_status()
-                data = resp.json()
-
-            if data.get("result"):
-                replies = []
-                for update in data["result"]:
-                    uid = update.get("update_id", 0)
-                    if uid > _last_seen_message_id:
-                        _last_seen_message_id = uid
-                    msg = update.get("message", {})
-                    text = msg.get("text", "")
-                    if text:
-                        replies.append(text)
-                if replies:
-                    return "Matt replied:\n" + "\n".join(replies)
-
-        return f"No reply received after {timeout_seconds}s timeout."
+        await _bot_send_message(NOTIFY_CHAT_ID, message)
+        if _inbound_loop_active:
+            return await _poll_for_reply_buffer(MessageBuffer.DM_KEY, timeout_seconds, poll_interval)
+        else:
+            return await _poll_for_reply_direct(timeout_seconds, poll_interval)
     except Exception as e:
         return log_and_format_error("ask", e)
 
@@ -536,7 +743,10 @@ async def ask(message: str, timeout_seconds: int = 300, poll_interval: int = 30)
         destructiveHint=True,
     )
 )
-async def andon(message: str, context: str = "", timeout_seconds: int = 300, poll_interval: int = 30) -> str:
+async def andon(
+    message: str, context: str = "", tmux_target: str | None = None,
+    timeout_seconds: int = 300, poll_interval: int = 30,
+) -> str:
     """
     Pull the andon cord — stop autonomous work and request human intervention.
 
@@ -551,78 +761,52 @@ async def andon(message: str, context: str = "", timeout_seconds: int = 300, pol
     Args:
         message: What you need from the human — be specific about the decision or blocker.
         context: Optional context about what you were working on (domain, task, session).
+        tmux_target: Optional tmux target (e.g. "village:chart"). When provided,
+            sends to and polls from a forum topic instead of DM.
         timeout_seconds: Max seconds to wait for reply (default: 300 = 5 min).
         poll_interval: Seconds between polling attempts (default: 30).
     """
-    global _last_seen_message_id
+    # Format with urgent prefix
+    formatted = f"🔴 ANDON — intervention needed\n\n{message}"
+    if context:
+        formatted += f"\n\n📍 Context: {context}"
+
+    # Log to calibration file (zero-token instrumentation)
+    try:
+        os.makedirs(os.path.dirname(CALIBRATION_LOG), exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        ctx_str = f" context={context}" if context else ""
+        log_entry = f"[{timestamp}] [ANDON] channel=telegram{ctx_str} \"{message}\"\n"
+        with open(CALIBRATION_LOG, "a") as f:
+            f.write(log_entry)
+    except Exception:
+        pass  # Never let logging failure block the actual andon cord pull
+
+    if tmux_target:
+        if not TELEGRAM_FORUM_GROUP_ID:
+            return "Error: TELEGRAM_FORUM_GROUP_ID not configured in .env"
+        try:
+            thread_id = await resolve_topic(
+                BOT_TOKEN, TELEGRAM_FORUM_GROUP_ID, tmux_target, topic_registry
+            )
+            await _bot_send_message(
+                TELEGRAM_FORUM_GROUP_ID, formatted, message_thread_id=thread_id
+            )
+            if _inbound_loop_active:
+                return await _poll_for_reply_buffer(tmux_target, timeout_seconds, poll_interval)
+            else:
+                return await _poll_for_reply_direct(timeout_seconds, poll_interval, thread_id=thread_id, tmux_target=tmux_target)
+        except Exception as e:
+            return log_and_format_error("andon", e, chat_id=TELEGRAM_FORUM_GROUP_ID)
+
     if not NOTIFY_CHAT_ID or not BOT_TOKEN:
         return "Error: NOTIFY_CHAT_ID and TELEGRAM_BOT_TOKEN required"
     try:
-        # Format with urgent prefix
-        formatted = f"🔴 ANDON — intervention needed\n\n{message}"
-        if context:
-            formatted += f"\n\n📍 Context: {context}"
-
-        # Log to calibration file (zero-token instrumentation)
-        try:
-            os.makedirs(os.path.dirname(CALIBRATION_LOG), exist_ok=True)
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-            ctx_str = f" context={context}" if context else ""
-            log_entry = f"[{timestamp}] [ANDON] channel=telegram{ctx_str} \"{message}\"\n"
-            with open(CALIBRATION_LOG, "a") as f:
-                f.write(log_entry)
-        except Exception:
-            pass  # Never let logging failure block the actual andon cord pull
-
-        # Send the message
-        entity = await client.get_entity(NOTIFY_CHAT_ID)
-        await client.send_message(entity, formatted, silent=False)
-
-        # Establish baseline — consume any pending updates
-        import httpx
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-        async with httpx.AsyncClient() as http:
-            params = {"allowed_updates": ["message"], "limit": 20}
-            if _last_seen_message_id > 0:
-                params["offset"] = _last_seen_message_id + 1
-            resp = await http.post(url, json=params)
-            resp.raise_for_status()
-            data = resp.json()
-            for update in data.get("result", []):
-                uid = update.get("update_id", 0)
-                if uid > _last_seen_message_id:
-                    _last_seen_message_id = uid
-
-        # Poll for reply
-        elapsed = 0
-        while elapsed < timeout_seconds:
-            await asyncio.sleep(poll_interval)
-            elapsed += poll_interval
-
-            async with httpx.AsyncClient() as http:
-                params = {
-                    "allowed_updates": ["message"],
-                    "limit": 20,
-                    "offset": _last_seen_message_id + 1,
-                }
-                resp = await http.post(url, json=params)
-                resp.raise_for_status()
-                data = resp.json()
-
-            if data.get("result"):
-                replies = []
-                for update in data["result"]:
-                    uid = update.get("update_id", 0)
-                    if uid > _last_seen_message_id:
-                        _last_seen_message_id = uid
-                    msg = update.get("message", {})
-                    text = msg.get("text", "")
-                    if text:
-                        replies.append(text)
-                if replies:
-                    return "Matt replied:\n" + "\n".join(replies)
-
-        return f"No reply received after {timeout_seconds}s timeout."
+        await _bot_send_message(NOTIFY_CHAT_ID, formatted)
+        if _inbound_loop_active:
+            return await _poll_for_reply_buffer(MessageBuffer.DM_KEY, timeout_seconds, poll_interval)
+        else:
+            return await _poll_for_reply_direct(timeout_seconds, poll_interval)
     except Exception as e:
         return log_and_format_error("andon", e, chat_id=NOTIFY_CHAT_ID)
 
@@ -671,7 +855,6 @@ async def get_messages(chat_id: Union[int, str], page: int = 1, page_size: int =
     """
     try:
         if BOT_TOKEN:
-            import httpx
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
             async with httpx.AsyncClient() as http:
                 resp = await http.post(url, json={"allowed_updates": ["message"], "limit": page_size})
@@ -4439,18 +4622,33 @@ async def reorder_folders(folder_ids: List[int]) -> str:
 
 
 async def _main() -> None:
+    global _inbound_loop_active
     try:
-        # Start the Telethon client non-interactively
-        print("Starting Telegram client...", file=sys.stderr)
-        await client.start(bot_token=BOT_TOKEN)
-        print("Telegram client started.", file=sys.stderr)
+        # Start inbound polling loop if forum group is configured
+        inbound_task = None
+        if TELEGRAM_FORUM_GROUP_ID and BOT_TOKEN:
+            inbound_task = asyncio.create_task(
+                run_inbound_loop(
+                    BOT_TOKEN, TELEGRAM_FORUM_GROUP_ID, topic_registry, _message_buffer
+                )
+            )
+            _inbound_loop_active = True
+            print("Inbound polling loop started.", file=sys.stderr)
 
-        if MCP_TRANSPORT == "stdio":
-            print("Running MCP server (stdio)...", file=sys.stderr)
-            await mcp.run_stdio_async()
-        else:
-            print(f"Running MCP server (SSE on 127.0.0.1:{MCP_PORT})...", file=sys.stderr)
-            await mcp.run_sse_async()
+        try:
+            if MCP_TRANSPORT == "stdio":
+                print("Running MCP server (stdio)...", file=sys.stderr)
+                await mcp.run_stdio_async()
+            else:
+                print(f"Running MCP server (SSE on 127.0.0.1:{MCP_PORT})...", file=sys.stderr)
+                await mcp.run_sse_async()
+        finally:
+            if inbound_task is not None:
+                inbound_task.cancel()
+                try:
+                    await inbound_task
+                except asyncio.CancelledError:
+                    pass
     except Exception as e:
         print(f"Error starting client: {e}", file=sys.stderr)
         sys.exit(1)
