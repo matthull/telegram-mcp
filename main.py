@@ -62,7 +62,31 @@ SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")
 MCP_PORT = int(os.getenv("MCP_PORT", "8485"))
 MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "sse")
 
-mcp = FastMCP("telegram", host="127.0.0.1", port=MCP_PORT)
+mcp = FastMCP(
+    "telegram",
+    host="127.0.0.1",
+    port=MCP_PORT,
+    instructions="""\
+Telegram messaging to the operator (Matt). Two routing modes:
+
+1. **Topic mode (primary):** Pass `tmux_target` (e.g. "musashi:code") to route
+   messages to a per-session forum topic. The value comes from your session
+   context as `telegram_tmux_target`. Always use it when present.
+2. **DM mode (fallback):** Omit `tmux_target` to send a direct message.
+
+Reply delivery in topic mode is push-based: when the operator replies, the MCP
+server dispatches the reply directly into your tmux pane via tmux-claude-send.
+The reply arrives as terminal input prefixed with "Telegram message from operator:".
+
+Tool selection:
+- `notify` — send a message (non-blocking). Use for all messages including questions.
+  In topic mode, replies are pushed to your terminal automatically. You can continue
+  working or wait — your choice.
+- `andon` — urgent intervention request. Same as notify but with urgent formatting
+  and auto-logging. Use when you must stop work and need the operator.
+- `close_topic` / `list_active_topics` — topic lifecycle management.
+""",
+)
 
 # Personal notification channel config
 NOTIFY_CHAT_ID = os.getenv("NOTIFY_CHAT_ID")
@@ -70,7 +94,6 @@ if NOTIFY_CHAT_ID:
     NOTIFY_CHAT_ID = int(NOTIFY_CHAT_ID)
 
 # Server-side tracking of last seen message ID for check_replies (DM path, no inbound loop)
-_last_seen_message_id = 0
 
 # Forum supergroup config for topic-based routing
 TELEGRAM_FORUM_GROUP_ID = os.getenv("TELEGRAM_FORUM_GROUP_ID")
@@ -379,9 +402,10 @@ def get_engagement_info(message) -> str:
 )
 async def notify(message: str, tmux_target: str | None = None) -> str:
     """
-    Send a message to Matt via Telegram. Use this when you need to notify,
-    ask a question, share a status update, or communicate anything to the user
-    who is away from the terminal.
+    Send a message to Matt via Telegram. This is the primary communication tool.
+
+    In topic mode (tmux_target provided), replies are pushed to your tmux pane
+    automatically — no need to call check_replies or ask. Just send and continue.
 
     Keep messages concise — this is a phone notification channel.
     Supports markdown formatting.
@@ -390,8 +414,9 @@ async def notify(message: str, tmux_target: str | None = None) -> str:
 
     Args:
         message: The message text (markdown supported).
-        tmux_target: Optional tmux target (e.g. "village:chart"). When provided,
-            routes message to a forum topic instead of DM.
+        tmux_target: tmux target from session context (e.g. "musashi:code").
+            Always pass this when telegram_tmux_target is in your context.
+            Routes to a per-session forum topic. Omit only for DM fallback.
     """
     if tmux_target:
         if not TELEGRAM_FORUM_GROUP_ID:
@@ -413,126 +438,6 @@ async def notify(message: str, tmux_target: str | None = None) -> str:
         return log_and_format_error("notify", e, chat_id=NOTIFY_CHAT_ID)
 
 
-async def _check_replies_direct(
-    thread_id: int | None = None,
-    tmux_target: str | None = None,
-) -> str:
-    """Shared helper: one-shot getUpdates check for new replies (fallback, no inbound loop).
-
-    Args:
-        thread_id: If set, filter to this forum thread only.
-        tmux_target: If set, use per-topic last_seen tracking. Otherwise use global DM tracking.
-    """
-    global _last_seen_message_id
-
-    if tmux_target:
-        last_seen = topic_registry.get_last_seen(tmux_target) or 0
-    else:
-        last_seen = _last_seen_message_id
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-    async with httpx.AsyncClient() as http:
-        params = {"allowed_updates": ["message"], "limit": 20}
-        if last_seen > 0:
-            params["offset"] = last_seen + 1
-        resp = await http.post(url, json=params)
-        resp.raise_for_status()
-        data = resp.json()
-
-    if not data.get("result"):
-        return "No new replies."
-
-    lines = []
-    max_update_id = last_seen
-    for update in data["result"]:
-        update_id = update.get("update_id", 0)
-        msg = update.get("message", {})
-        # Filter by thread_id if topic path
-        if thread_id is not None and msg.get("message_thread_id") != thread_id:
-            continue
-        if update_id > max_update_id:
-            max_update_id = update_id
-        text = msg.get("text", "")
-        date = msg.get("date", "")
-        if text:
-            lines.append(f"[{date}] {text}")
-
-    if max_update_id > last_seen:
-        if tmux_target:
-            topic_registry.set_last_seen(tmux_target, max_update_id)
-        else:
-            _last_seen_message_id = max_update_id
-
-    if not lines:
-        return "No new replies."
-    return "Replies from Matt:\n" + "\n".join(lines)
-
-
-@mcp.tool(
-    annotations=ToolAnnotations(
-        title="Check for Replies from Matt",
-        openWorldHint=True,
-        readOnlyHint=True,
-    )
-)
-async def check_replies(tmux_target: str | None = None) -> str:
-    """
-    Check for new messages from Matt since the last check. Returns only
-    messages not previously seen (tracks last-seen ID server-side).
-
-    Returns "No new replies." if nothing new, otherwise returns the messages.
-    Call this after sending a notification to see if Matt has responded.
-
-    Args:
-        tmux_target: Optional tmux target (e.g. "village:chart"). When provided,
-            checks only the forum topic for that target using per-topic tracking.
-    """
-    global _last_seen_message_id
-    if not BOT_TOKEN:
-        return "Error: Bot token required for check_replies"
-
-    # When inbound loop is active, read from buffer
-    if _inbound_loop_active:
-        try:
-            if tmux_target:
-                if not TELEGRAM_FORUM_GROUP_ID:
-                    return "Error: TELEGRAM_FORUM_GROUP_ID not configured in .env"
-                thread_id = topic_registry.get_topic_id(tmux_target)
-                if thread_id is None:
-                    return "No new replies."
-                messages = await _message_buffer.consume(tmux_target)
-            else:
-                messages = await _message_buffer.consume(MessageBuffer.DM_KEY)
-
-            if not messages:
-                return "No new replies."
-            lines = []
-            for msg in messages:
-                text = msg.get("text", "")
-                date = msg.get("date", "")
-                if text:
-                    lines.append(f"[{date}] {text}")
-            if not lines:
-                return "No new replies."
-            return "Replies from Matt:\n" + "\n".join(lines)
-        except Exception as e:
-            return log_and_format_error("check_replies", e)
-
-    # Fallback: direct getUpdates (DM-only mode, no inbound loop)
-    if tmux_target:
-        if not TELEGRAM_FORUM_GROUP_ID:
-            return "Error: TELEGRAM_FORUM_GROUP_ID not configured in .env"
-        try:
-            thread_id = topic_registry.get_topic_id(tmux_target)
-            if thread_id is None:
-                return "No new replies."
-            return await _check_replies_direct(thread_id=thread_id, tmux_target=tmux_target)
-        except Exception as e:
-            return log_and_format_error("check_replies", e)
-    try:
-        return await _check_replies_direct()
-    except Exception as e:
-        return log_and_format_error("check_replies", e)
 
 
 @mcp.tool(
@@ -591,151 +496,6 @@ async def list_active_topics() -> str:
     return f"Registered topics ({len(topics)}):\n" + "\n".join(lines)
 
 
-async def _poll_for_reply_buffer(
-    buffer_key: str, timeout_seconds: int, poll_interval: int,
-) -> str:
-    """Shared helper: poll message buffer for a reply. Used by ask/andon when inbound loop is active."""
-    elapsed = 0
-    while elapsed < timeout_seconds:
-        messages = await _message_buffer.wait_for_messages(buffer_key, timeout=poll_interval)
-        elapsed += poll_interval
-        if messages:
-            replies = [m["text"] for m in messages if m.get("text")]
-            if replies:
-                return "Matt replied:\n" + "\n".join(replies)
-    return f"No reply received after {timeout_seconds}s timeout."
-
-
-async def _poll_for_reply_direct(
-    timeout_seconds: int,
-    poll_interval: int,
-    thread_id: int | None = None,
-    tmux_target: str | None = None,
-) -> str:
-    """Shared helper: poll getUpdates directly for a reply (fallback when no inbound loop).
-
-    Args:
-        timeout_seconds: Max wait time.
-        poll_interval: Seconds between polls.
-        thread_id: If set, filter messages to this forum thread only (topic path).
-        tmux_target: If set, use per-topic last_seen tracking. Otherwise use global DM tracking.
-    """
-    global _last_seen_message_id
-
-    # Resolve offset tracking — per-topic or global
-    if tmux_target:
-        last_seen = topic_registry.get_last_seen(tmux_target) or 0
-    else:
-        last_seen = _last_seen_message_id
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-
-    # Establish baseline
-    async with httpx.AsyncClient() as http:
-        params = {"allowed_updates": ["message"], "limit": 20}
-        if last_seen > 0:
-            params["offset"] = last_seen + 1
-        resp = await http.post(url, json=params)
-        resp.raise_for_status()
-        data = resp.json()
-        for update in data.get("result", []):
-            uid = update.get("update_id", 0)
-            if uid > last_seen:
-                last_seen = uid
-
-    # Poll for reply
-    elapsed = 0
-    while elapsed < timeout_seconds:
-        await asyncio.sleep(poll_interval)
-        elapsed += poll_interval
-
-        async with httpx.AsyncClient() as http:
-            params = {
-                "allowed_updates": ["message"],
-                "limit": 20,
-                "offset": last_seen + 1,
-            }
-            resp = await http.post(url, json=params)
-            resp.raise_for_status()
-            data = resp.json()
-
-        if data.get("result"):
-            replies = []
-            for update in data["result"]:
-                uid = update.get("update_id", 0)
-                if uid > last_seen:
-                    last_seen = uid
-                msg = update.get("message", {})
-                # Filter by thread_id if topic path
-                if thread_id is not None and msg.get("message_thread_id") != thread_id:
-                    continue
-                text = msg.get("text", "")
-                if text:
-                    replies.append(text)
-            # Persist offset
-            if tmux_target:
-                topic_registry.set_last_seen(tmux_target, last_seen)
-            else:
-                _last_seen_message_id = last_seen
-            if replies:
-                return "Matt replied:\n" + "\n".join(replies)
-
-    return f"No reply received after {timeout_seconds}s timeout."
-
-
-@mcp.tool(
-    annotations=ToolAnnotations(
-        title="Send Message and Wait for Reply",
-        openWorldHint=True,
-        destructiveHint=True,
-    )
-)
-async def ask(
-    message: str, tmux_target: str | None = None,
-    timeout_seconds: int = 300, poll_interval: int = 30,
-) -> str:
-    """
-    Send a message to Matt and wait for a reply. Blocks until Matt responds
-    or the timeout is reached. Use this when you need input before continuing.
-
-    This is the preferred tool when you need a decision, approval, or answer
-    from the user. It sends the message and polls for a reply automatically.
-
-    Args:
-        message: The question or message to send (markdown supported).
-        tmux_target: Optional tmux target (e.g. "village:chart"). When provided,
-            sends to and polls from a forum topic instead of DM.
-        timeout_seconds: Max seconds to wait for reply (default: 300 = 5 min).
-        poll_interval: Seconds between polling attempts (default: 30).
-    """
-    if tmux_target:
-        if not TELEGRAM_FORUM_GROUP_ID:
-            return "Error: TELEGRAM_FORUM_GROUP_ID not configured in .env"
-        try:
-            thread_id = await resolve_topic(
-                BOT_TOKEN, TELEGRAM_FORUM_GROUP_ID, tmux_target, topic_registry
-            )
-            await _bot_send_message(
-                TELEGRAM_FORUM_GROUP_ID, message, message_thread_id=thread_id
-            )
-            if _inbound_loop_active:
-                return await _poll_for_reply_buffer(tmux_target, timeout_seconds, poll_interval)
-            else:
-                return await _poll_for_reply_direct(timeout_seconds, poll_interval, thread_id=thread_id, tmux_target=tmux_target)
-        except Exception as e:
-            return log_and_format_error("ask", e)
-    if not NOTIFY_CHAT_ID or not BOT_TOKEN:
-        return "Error: NOTIFY_CHAT_ID and TELEGRAM_BOT_TOKEN required"
-    try:
-        await _bot_send_message(NOTIFY_CHAT_ID, message)
-        if _inbound_loop_active:
-            return await _poll_for_reply_buffer(MessageBuffer.DM_KEY, timeout_seconds, poll_interval)
-        else:
-            return await _poll_for_reply_direct(timeout_seconds, poll_interval)
-    except Exception as e:
-        return log_and_format_error("ask", e)
-
-
 @mcp.tool(
     annotations=ToolAnnotations(
         title="Pull the Andon Cord",
@@ -745,26 +505,23 @@ async def ask(
 )
 async def andon(
     message: str, context: str = "", tmux_target: str | None = None,
-    timeout_seconds: int = 300, poll_interval: int = 30,
 ) -> str:
     """
     Pull the andon cord — stop autonomous work and request human intervention.
 
-    Use this when you are executing autonomously (not in interactive conversation)
-    and hit a situation that requires human judgment, approval, or decision.
-    This is semantically distinct from notify (FYI) and ask (casual question).
-    Andon means: "I'm stopping work because I need you."
+    Use this when you are executing autonomously and hit a situation that
+    requires human judgment, approval, or decision. Semantically distinct
+    from notify (FYI). Andon means: "I'm stopping work because I need you."
 
-    The message is sent with urgent formatting and auto-logged to the autonomy
-    calibration log. After sending, polls for a reply (like ask).
+    Non-blocking: sends the message and returns immediately. In topic mode,
+    the operator's reply is pushed to your tmux pane automatically.
+    Auto-logs to the autonomy calibration log.
 
     Args:
         message: What you need from the human — be specific about the decision or blocker.
         context: Optional context about what you were working on (domain, task, session).
-        tmux_target: Optional tmux target (e.g. "village:chart"). When provided,
-            sends to and polls from a forum topic instead of DM.
-        timeout_seconds: Max seconds to wait for reply (default: 300 = 5 min).
-        poll_interval: Seconds between polling attempts (default: 30).
+        tmux_target: tmux target from session context (e.g. "musashi:code").
+            Always pass this when telegram_tmux_target is in your context.
     """
     # Format with urgent prefix
     formatted = f"🔴 ANDON — intervention needed\n\n{message}"
@@ -792,10 +549,7 @@ async def andon(
             await _bot_send_message(
                 TELEGRAM_FORUM_GROUP_ID, formatted, message_thread_id=thread_id
             )
-            if _inbound_loop_active:
-                return await _poll_for_reply_buffer(tmux_target, timeout_seconds, poll_interval)
-            else:
-                return await _poll_for_reply_direct(timeout_seconds, poll_interval, thread_id=thread_id, tmux_target=tmux_target)
+            return "Andon sent."
         except Exception as e:
             return log_and_format_error("andon", e, chat_id=TELEGRAM_FORUM_GROUP_ID)
 
@@ -803,10 +557,7 @@ async def andon(
         return "Error: NOTIFY_CHAT_ID and TELEGRAM_BOT_TOKEN required"
     try:
         await _bot_send_message(NOTIFY_CHAT_ID, formatted)
-        if _inbound_loop_active:
-            return await _poll_for_reply_buffer(MessageBuffer.DM_KEY, timeout_seconds, poll_interval)
-        else:
-            return await _poll_for_reply_direct(timeout_seconds, poll_interval)
+        return "Andon sent."
     except Exception as e:
         return log_and_format_error("andon", e, chat_id=NOTIFY_CHAT_ID)
 
